@@ -1,0 +1,9 @@
+{
+    "telegram_bot_token": "7140895678:AAHMl0ZWBMbaWMmFx-8XLoLmsSscfFNn8Vw",
+    "openrouter_api_key": "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",
+    "bot_username": "@personal_tarot_ai_bot",
+    "model_name": "openai/gpt-oss-120b",
+    "max_message_length": 4096,
+    "max_response_tokens": 8000,
+    "temperature": 0.3
+}

@@ -1,1 +1,0 @@
-# personal_tarot_ai_bot
