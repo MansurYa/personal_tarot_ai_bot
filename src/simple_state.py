@@ -201,6 +201,52 @@ def cleanup_old_states(max_age_hours: int = 24) -> int:
     return len(old_chat_ids)
 
 
+# Функции для управления сообщениями в чате
+def add_message_to_delete(chat_id: int, message_id: int) -> None:
+    """
+    Добавляет ID сообщения для последующего удаления
+    
+    :param chat_id: ID чата пользователя
+    :param message_id: ID сообщения для удаления
+    """
+    if chat_id not in _user_states:
+        _user_states[chat_id] = {
+            'state': UserState.IDLE,
+            'data': {},
+            'timestamp': datetime.now()
+        }
+    
+    if 'messages_to_delete' not in _user_states[chat_id]['data']:
+        _user_states[chat_id]['data']['messages_to_delete'] = []
+    
+    _user_states[chat_id]['data']['messages_to_delete'].append(message_id)
+    logger.info(f"Добавлено сообщение {message_id} для удаления в чате {chat_id}")
+
+
+def get_messages_to_delete(chat_id: int) -> list:
+    """
+    Получает список ID сообщений для удаления
+    
+    :param chat_id: ID чата пользователя
+    :return: Список ID сообщений
+    """
+    if chat_id not in _user_states:
+        return []
+    
+    return _user_states[chat_id]['data'].get('messages_to_delete', [])
+
+
+def clear_messages_to_delete(chat_id: int) -> None:
+    """
+    Очищает список сообщений для удаления
+    
+    :param chat_id: ID чата пользователя
+    """
+    if chat_id in _user_states and 'messages_to_delete' in _user_states[chat_id]['data']:
+        del _user_states[chat_id]['data']['messages_to_delete']
+        logger.info(f"Очищен список сообщений для удаления в чате {chat_id}")
+
+
 # Служебные функции для тестирования
 def _test_state_manager():
     """

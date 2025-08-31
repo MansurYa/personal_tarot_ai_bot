@@ -7,6 +7,7 @@ import logging
 from typing import Optional
 from telegram import Message
 from telegram.ext import ContextTypes
+from src.simple_state import add_message_to_delete
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,8 @@ class TarotProgressBar:
     
     def _generate_progress_visual(self, progress: int) -> str:
         """Генерирует визуальный прогресс-бар"""
-        # Всего звезд в баре
-        total_stars = 20
+        # Уменьшаем количество звезд в 2 раза для мобильных
+        total_stars = 10  # было 20, стало 10
         filled_stars = int((progress / 100) * total_stars)
         empty_stars = total_stars - filled_stars
         
@@ -43,7 +44,7 @@ class TarotProgressBar:
     
     def _format_progress_message(self, progress: int) -> str:
         """Форматирует сообщение прогресс-бара"""
-        stage_text = self.STAGES.get(progress, "🔮 Обрабатываю...")
+        stage_text = self.STAGES.get(progress, "Обрабатываю...")
         progress_visual = self._generate_progress_visual(progress)
         
         message = (
@@ -140,6 +141,7 @@ class InterpretationProgress:
     def __init__(self, progress_bar: TarotProgressBar):
         self.progress_bar = progress_bar
         self.current_stage = 0
+        self.update_context = None  # Для создания новых прогресс-баров
         
     async def start_image_generation(self):
         """Этап 1: 0-25% - Генерация изображения расклада"""
@@ -169,6 +171,52 @@ class InterpretationProgress:
         """Отменяет прогресс-бар"""
         await self.progress_bar.cancel()
     
+    def set_update_context(self, update, context):
+        """Сохраняет контекст для создания новых прогресс-баров"""
+        self.update_context = (update, context)
+    
+    async def recreate_progress_bar(self, current_progress: int):
+        """Пересоздает прогресс-бар внизу чата для лучшей видимости"""
+        if not self.update_context:
+            return False
+            
+        try:
+            # Удаляем старый прогресс-бар
+            await self.progress_bar.cancel()
+            
+            # Создаем новый внизу чата
+            update, context = self.update_context
+            chat_id = update.effective_chat.id
+            
+            # Формируем сообщение для нового прогресс-бара
+            progress_visual = self.progress_bar._generate_progress_visual(current_progress)
+            stage_text = self.progress_bar.STAGES.get(current_progress, "Обрабатываю...")
+            
+            message_text = (
+                f"🔮 **Генерирую интерпретацию вашего расклада**\\n\\n"
+                f"{progress_visual} {current_progress}%\\n\\n"
+                f"{stage_text}"
+            )
+            
+            progress_message = await update.message.reply_text(
+                message_text,
+                parse_mode='Markdown'
+            )
+            
+            # Трекируем новое сообщение для удаления
+            add_message_to_delete(chat_id, progress_message.message_id)
+            
+            # Обновляем прогресс-бар
+            self.progress_bar = TarotProgressBar(progress_message)
+            self.progress_bar.current_progress = current_progress
+            
+            logger.info(f"Прогресс-бар пересоздан внизу чата для {current_progress}%")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка при пересоздании прогресс-бара: {e}")
+            return False
+    
     async def start_context_analysis(self):
         """Этап 2: 25-50% - Промпт 04 (анализ контекста)"""
         if self.current_stage == 2:
@@ -179,7 +227,10 @@ class InterpretationProgress:
     async def complete_context_analysis(self):
         """Завершение анализа контекста"""
         if self.current_stage == 2:
-            await self.progress_bar.update_progress(50)
+            # Пересоздаем прогресс-бар внизу на 50%
+            recreated = await self.recreate_progress_bar(50)
+            if not recreated:
+                await self.progress_bar.update_progress(50)
             await asyncio.sleep(0.3)
             self.current_stage = 3
     
@@ -193,7 +244,10 @@ class InterpretationProgress:
     async def complete_synthesis(self):
         """Завершение синтеза"""
         if self.current_stage == 3:
-            await self.progress_bar.update_progress(75)
+            # Пересоздаем прогресс-бар внизу на 75%
+            recreated = await self.recreate_progress_bar(75)
+            if not recreated:
+                await self.progress_bar.update_progress(75)
             await asyncio.sleep(0.3)
             self.current_stage = 4
     
@@ -224,17 +278,21 @@ async def create_progress_bar(update, context: ContextTypes.DEFAULT_TYPE) -> Tar
     :return: Экземпляр TarotProgressBar
     """
     try:
-        # Создаем начальное сообщение
+        # Создаем начальное сообщение (с уменьшенным количеством звёзд)
         initial_message = (
             f"🔮 **Генерирую интерпретацию вашего расклада**\n\n"
-            f"☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆☆ 0%\n\n"
-            f"🎴 Раскладываю карты..."
+            f"☆☆☆☆☆☆☆☆☆☆ 0%\n\n"
+            f"🔮 Подготавливаю расклад..."
         )
         
         progress_message = await update.message.reply_text(
             initial_message,
             parse_mode='Markdown'
         )
+        
+        # Трекируем сообщение для удаления 
+        chat_id = update.effective_chat.id
+        add_message_to_delete(chat_id, progress_message.message_id)
         
         # Создаем прогресс-бар
         progress_bar = TarotProgressBar(progress_message)

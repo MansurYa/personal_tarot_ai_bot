@@ -19,7 +19,7 @@ class TarotDeck:
         if cards_file_path is None:
             # Путь по умолчанию относительно корня проекта
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            cards_file_path = os.path.join(project_root, 'assets', 'tarot-cards-images-info.json')
+            cards_file_path = os.path.join(project_root, 'assets', 'tarot-cards-images-info-ru.json')
         
         self.cards_file_path = cards_file_path
         self._cards = []

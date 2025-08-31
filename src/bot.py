@@ -75,6 +75,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     Обработчик ошибок
     Логирует все ошибки, которые происходят в боте
     """
+    error_str = str(context.error)
+    
+    # Проверяем, не является ли это конфликтом polling
+    if "Conflict: terminated by other getUpdates request" in error_str:
+        logger.warning("Обнаружен конфликт getUpdates - другий экземпляр бота может быть запущен")
+        return
+    
+    # Сетевые ошибки - логируем как warning, не как error
+    if any(network_error in error_str.lower() for network_error in [
+        "nodename nor servname provided", "server disconnected", 
+        "connection", "timeout", "network", "connect"
+    ]):
+        logger.warning(f"Сетевая ошибка (автоматическое восстановление): {context.error}")
+        return
+    
+    # Ошибки Telegram API - логируем как info  
+    if any(tg_error in error_str.lower() for tg_error in [
+        "message to delete not found", "message is not modified", 
+        "bad request", "forbidden"
+    ]):
+        logger.info(f"Telegram API уведомление: {context.error}")
+        return
+    
+    # Остальные ошибки логируем как error
     logger.error(f"Исключение при обработке обновления {update}:", exc_info=context.error)
 
 
@@ -108,9 +132,19 @@ def run_bot(config=None):
         else:
             print("✅ Хранилище пользователей готово")
         
-        # Инициализируем приложение
+        # Инициализируем приложение с дополнительными параметрами для устранения конфликтов
         print("🤖 Инициализируем бота...")
-        application = Application.builder().token(config['telegram_bot_token']).build()
+        application = (Application.builder()
+            .token(config['telegram_bot_token'])
+            .read_timeout(30)
+            .write_timeout(30)
+            .connect_timeout(30)
+            .pool_timeout(30)
+            .get_updates_read_timeout(30)
+            .get_updates_write_timeout(30)
+            .get_updates_connect_timeout(30)
+            .get_updates_pool_timeout(30)
+            .build())
         
         # Регистрируем обработчики команд
         print("📝 Регистрируем обработчики...")
@@ -146,8 +180,15 @@ def run_bot(config=None):
         print("💾 Данные пользователей сохраняются в data/users.json")
         print("⚡ Бот готов к работе! Нажмите Ctrl+C для остановки.")
         
-        # Запускаем polling (блокирующий вызов)
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Запускаем polling с дополнительными параметрами для устранения конфликтов
+        print("🔄 Ожидание разрешения возможных конфликтов...")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,  # Очищаем pending обновления
+            poll_interval=2.0,          # Увеличен интервал polling для стабильности
+            timeout=20,                 # Увеличен timeout для getUpdates  
+            bootstrap_retries=5         # Количество попыток переподключения
+        )
         
     except KeyboardInterrupt:
         print("\n🛑 Получен сигнал остановки...")

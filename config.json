@@ -1,9 +1,32 @@
 {
     "telegram_bot_token": "7140895678:AAHMl0ZWBMbaWMmFx-8XLoLmsSscfFNn8Vw",
-    "openrouter_api_key": "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",
+    "openrouter_api_key": "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",
     "bot_username": "@personal_tarot_ai_bot",
-    "model_name": "openai/gpt-oss-120b",
+    "model_name": "deepseek/deepseek-chat-v3-0324:free",
     "max_message_length": 4096,
     "max_response_tokens": 8000,
-    "temperature": 0.3
+    "temperature": 0.3,
+    "tariff_plans": {
+        "beginner": {
+            "name": "Начинающий таролог",
+            "description": "Начинающая таролог с искренними намерениями и светлым разумом. Делает тайны карт понятными каждому.",
+            "model_name": "openai/gpt-oss-120b",
+            "initial_credits": 30,
+            "icon": "✨"
+        },
+        "expert": {
+            "name": "Прожжённая опытом",
+            "description": "Мудрая наставница, повидавшая тысячи судеб. Читает не только карты, но и саму суть человека.",
+            "model_name": "google/gemini-2.5-pro",
+            "initial_credits": 3,
+            "icon": "🔮"
+        }
+    },
+    "limitations": {
+        "refill_available": false,
+        "refill_message": "В настоящее время возможность пополнить количество раскладов отсутствует."
+    },
+    "features": {
+        "use_magic_numbers": false
+    }
 }

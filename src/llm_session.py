@@ -26,16 +26,20 @@ class InterpretationStage:
 class LLMSession:
     """Класс для управления многоэтапной генерацией интерпретации"""
     
-    def __init__(self, prompt_manager: PromptManager):
+    def __init__(self, prompt_manager: PromptManager, model_name: str = None):
         self.prompt_manager = prompt_manager
         self.config = load_config()
         
         # Создаем MessageContext с mode=2 (критически важно!)
         self.context = MessageContext(task_prompt=None)
         
+        # Используем переданную модель или берем из конфига
+        if model_name is None:
+            model_name = self.config.get("model_name", "deepseek/deepseek-chat-v3-0324:free")
+        
         # Создаем TarotLLMAgent
         self.agent = TarotLLMAgent(
-            model_name=self.config.get("model_name", "deepseek/deepseek-chat-v3-0324:free"),
+            model_name=model_name,
             api_key=self.config.get("openrouter_api_key"),
             max_tokens=self.config.get("max_response_tokens", 8000),
             temperature=self.config.get("temperature", 0.3)

@@ -105,37 +105,52 @@ def _save_users(users: Dict[str, Dict[str, Any]]) -> bool:
         return False
 
 
-def user_exists(chat_id: int) -> bool:
+def user_exists(user_id: int = None, chat_id: int = None) -> bool:
     """
-    Проверяет существование пользователя
+    Проверяет существование пользователя (теперь по user_id в первую очередь)
     
-    :param chat_id: ID чата пользователя
+    :param user_id: ID пользователя Telegram (приоритетный)
+    :param chat_id: ID чата пользователя (для совместимости)
     :return: True если пользователь существует
     
     Примеры использования:
-    >>> user_exists(123456)
+    >>> user_exists(user_id=987654)
     False
-    >>> save_user(123456, "Анна", "1990-03-15")
-    >>> user_exists(123456)
-    True
+    >>> user_exists(chat_id=123456)  # Поиск по старому chat_id для совместимости
+    False
     """
     users = _load_users()
-    return str(chat_id) in users
-
-
-def save_user(chat_id: int, name: str, birthdate: str) -> bool:
-    """
-    Сохраняет нового пользователя
     
-    :param chat_id: ID чата пользователя
-    :param name: Имя пользователя
+    # Приоритет - поиск по user_id
+    if user_id is not None:
+        return str(user_id) in users
+    
+    # Совместимость - поиск по chat_id в данных пользователей
+    if chat_id is not None:
+        for user_data in users.values():
+            if user_data.get('chat_id') == chat_id:
+                return True
+    
+    return False
+
+
+def save_user(chat_id: int, user_id: int, name: str, birthdate: str, 
+               telegram_username: str = None, telegram_first_name: str = None, 
+               telegram_last_name: str = None) -> bool:
+    """
+    Сохраняет нового пользователя (теперь по user_id для защиты от обхода через удаление чата)
+    
+    :param chat_id: ID чата пользователя (для совместимости)
+    :param user_id: ID пользователя Telegram (основной ключ)
+    :param name: Имя пользователя (введенное при регистрации)
     :param birthdate: Дата рождения в формате YYYY-MM-DD
+    :param telegram_username: @username пользователя в Telegram
+    :param telegram_first_name: Имя из профиля Telegram
+    :param telegram_last_name: Фамилия из профиля Telegram
     :return: True если пользователь сохранён успешно
     
     Примеры использования:
-    >>> save_user(123456, "Анна", "1990-03-15")
-    True
-    >>> save_user(654321, "Александр", "1985-12-25")
+    >>> save_user(123456, 987654, "Анна", "1990-03-15", "anna_user")
     True
     """
     try:
@@ -146,46 +161,71 @@ def save_user(chat_id: int, name: str, birthdate: str) -> bool:
         
         users = _load_users()
         
-        # Создаём данные пользователя
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        user_data = {
-            "chat_id": chat_id,
-            "name": name,
-            "birthdate": birthdate,
-            "created_at": current_time,
-            "last_spread": None  # Будет установлено при первом раскладе
+        # Получаем начальные лимиты из конфигурации
+        from src.config import load_config
+        config = load_config()
+        tariff_plans = config.get('tariff_plans', {})
+        
+        initial_credits = {
+            'beginner': tariff_plans.get('beginner', {}).get('initial_credits', 3),
+            'expert': tariff_plans.get('expert', {}).get('initial_credits', 1)
         }
         
-        users[str(chat_id)] = user_data
+        # Создаём данные пользователя (используем user_id как основной ключ)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_data = {
+            "chat_id": chat_id,  # Оставляем для совместимости
+            "user_id": user_id,  # Основной идентификатор
+            "name": name,
+            "birthdate": birthdate,
+            "telegram_username": telegram_username,
+            "telegram_first_name": telegram_first_name,
+            "telegram_last_name": telegram_last_name,
+            "created_at": current_time,
+            "last_spread": None,
+            "credits": initial_credits.copy()  # Количество доступных раскладов по тарифам
+        }
+        
+        users[str(user_id)] = user_data  # Сохраняем по user_id вместо chat_id
         
         if _save_users(users):
-            logger.info(f"Пользователь сохранён: chat_id={chat_id}, name={name}")
+            logger.info(f"Пользователь сохранён: user_id={user_id}, name={name}, credits={initial_credits}")
             return True
         else:
             return False
             
     except Exception as e:
-        logger.error(f"Ошибка сохранения пользователя {chat_id}: {e}")
+        logger.error(f"Ошибка сохранения пользователя {user_id}: {e}")
         return False
 
 
-def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
+def get_user(user_id: int = None, chat_id: int = None) -> Optional[Dict[str, Any]]:
     """
-    Возвращает данные пользователя
+    Возвращает данные пользователя (теперь по user_id в первую очередь)
     
-    :param chat_id: ID чата пользователя
+    :param user_id: ID пользователя Telegram (приоритетный)
+    :param chat_id: ID чата пользователя (для совместимости)
     :return: Словарь с данными пользователя или None если не найден
     
     Примеры использования:
-    >>> user = get_user(123456)
+    >>> user = get_user(user_id=987654)
     >>> if user:
     ...     print(f"Имя: {user['name']}, возраст: {user['age']}")
-    >>> get_user(999999)  # Несуществующий пользователь
-    None
     """
     try:
         users = _load_users()
-        user_data = users.get(str(chat_id))
+        user_data = None
+        
+        # Приоритет - поиск по user_id
+        if user_id is not None:
+            user_data = users.get(str(user_id))
+        
+        # Совместимость - поиск по chat_id в данных пользователей
+        if user_data is None and chat_id is not None:
+            for uid, data in users.items():
+                if data.get('chat_id') == chat_id:
+                    user_data = data
+                    break
         
         if user_data:
             # Добавляем вычисленный возраст
@@ -200,7 +240,7 @@ def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
                         age -= 1
                     user_copy['age'] = age
                 except Exception as e:
-                    logger.warning(f"Ошибка вычисления возраста для {chat_id}: {e}")
+                    logger.warning(f"Ошибка вычисления возраста для user_id={user_id}, chat_id={chat_id}: {e}")
                     user_copy['age'] = None
             
             return user_copy
@@ -208,39 +248,132 @@ def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
         return None
         
     except Exception as e:
-        logger.error(f"Ошибка получения пользователя {chat_id}: {e}")
+        logger.error(f"Ошибка получения пользователя user_id={user_id}, chat_id={chat_id}: {e}")
         return None
 
 
-def update_last_spread(chat_id: int) -> bool:
+def get_user_credits(user_id: int) -> Optional[Dict[str, int]]:
     """
-    Обновляет время последнего расклада пользователя
+    Возвращает количество кредитов пользователя по тарифам
     
-    :param chat_id: ID чата пользователя
-    :return: True если обновление прошло успешно
+    :param user_id: ID пользователя Telegram
+    :return: Словарь с количеством кредитов {'beginner': int, 'expert': int} или None
+    """
+    try:
+        user_data = get_user(user_id=user_id)
+        if user_data:
+            return user_data.get('credits', {'beginner': 0, 'expert': 0})
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка получения кредитов пользователя {user_id}: {e}")
+        return None
+
+
+def use_credit(user_id: int, tariff: str) -> bool:
+    """
+    Списывает один кредит с указанного тарифа пользователя
     
-    Примеры использования:
-    >>> update_last_spread(123456)
-    True
+    :param user_id: ID пользователя Telegram
+    :param tariff: Тариф ('beginner' или 'expert')
+    :return: True если кредит успешно списан
     """
     try:
         users = _load_users()
+        user_key = str(user_id)
         
-        if str(chat_id) not in users:
-            logger.warning(f"Попытка обновить последний расклад для несуществующего пользователя: {chat_id}")
+        if user_key not in users:
+            logger.warning(f"Попытка списать кредит для несуществующего пользователя: {user_id}")
             return False
         
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        users[str(chat_id)]['last_spread'] = current_time
+        user_data = users[user_key]
+        credits = user_data.get('credits', {'beginner': 0, 'expert': 0})
+        
+        if tariff not in credits:
+            logger.warning(f"Неизвестный тариф: {tariff}")
+            return False
+        
+        if credits[tariff] <= 0:
+            logger.warning(f"Недостаточно кредитов на тарифе {tariff} для пользователя {user_id}")
+            return False
+        
+        # Списываем кредит
+        credits[tariff] -= 1
+        users[user_key]['credits'] = credits
         
         if _save_users(users):
-            logger.info(f"Обновлено время последнего расклада для пользователя {chat_id}")
+            logger.info(f"Списан кредит с тарифа {tariff} для пользователя {user_id}. Осталось: {credits[tariff]}")
             return True
         else:
             return False
             
     except Exception as e:
-        logger.error(f"Ошибка обновления времени расклада для {chat_id}: {e}")
+        logger.error(f"Ошибка списания кредита для пользователя {user_id}: {e}")
+        return False
+
+
+def has_credits(user_id: int, tariff: str) -> bool:
+    """
+    Проверяет наличие кредитов на указанном тарифе
+    
+    :param user_id: ID пользователя Telegram
+    :param tariff: Тариф ('beginner' или 'expert')
+    :return: True если есть кредиты
+    """
+    credits = get_user_credits(user_id)
+    if credits and tariff in credits:
+        return credits[tariff] > 0
+    return False
+
+
+def update_last_spread(user_id: int = None, chat_id: int = None) -> bool:
+    """
+    Обновляет время последнего расклада пользователя (теперь по user_id в первую очередь)
+    
+    :param user_id: ID пользователя Telegram (приоритетный)
+    :param chat_id: ID чата пользователя (для совместимости)
+    :return: True если обновление прошло успешно
+    
+    Примеры использования:
+    >>> update_last_spread(user_id=987654)
+    True
+    """
+    try:
+        users = _load_users()
+        user_key = None
+        
+        # Приоритет - поиск по user_id
+        if user_id is not None:
+            user_key = str(user_id)
+            if user_key not in users:
+                logger.warning(f"Попытка обновить последний расклад для несуществующего user_id: {user_id}")
+                return False
+        
+        # Совместимость - поиск по chat_id
+        elif chat_id is not None:
+            for uid, data in users.items():
+                if data.get('chat_id') == chat_id:
+                    user_key = uid
+                    break
+            
+            if user_key is None:
+                logger.warning(f"Попытка обновить последний расклад для несуществующего chat_id: {chat_id}")
+                return False
+        
+        if user_key is None:
+            logger.warning("Не указан ни user_id, ни chat_id для обновления времени расклада")
+            return False
+        
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        users[user_key]['last_spread'] = current_time
+        
+        if _save_users(users):
+            logger.info(f"Обновлено время последнего расклада для пользователя {user_key}")
+            return True
+        else:
+            return False
+            
+    except Exception as e:
+        logger.error(f"Ошибка обновления времени расклада для user_id={user_id}, chat_id={chat_id}: {e}")
         return False
 
 

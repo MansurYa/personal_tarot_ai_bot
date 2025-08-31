@@ -6,17 +6,105 @@ import io
 import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from src.keyboards import main_menu, spreads_menu, back_button, SPREAD_NAMES
-from src.simple_state import UserState, get_state, set_state, update_data, get_user_data, reset_to_idle
+from src.keyboards import main_menu, spreads_menu, back_button, SPREAD_NAMES, tariff_selection_menu, credits_info_menu
+from src.simple_state import UserState, get_state, set_state, update_data, get_user_data, reset_to_idle, add_message_to_delete
 from src.validators import validate_name, validate_birthdate, validate_magic_number
-from src.user_manager import user_exists, save_user, get_user, update_last_spread
+from src.user_manager import user_exists, save_user, get_user, update_last_spread, get_user_credits, use_credit, has_credits
+from src.config import load_config
 from src.spread_configs import get_spread_config
 from src.card_manager import TarotDeck, select_cards
 from src.image_generator import ImageGenerator
 from src.spread_questions import get_questions_for_spread, get_spread_type_from_callback
 from src.llm_integration import start_llm_interpretation, process_llm_questions
+
 from src.feedback_system import get_feedback_system
 from PIL import Image
+
+def is_magic_numbers_enabled() -> bool:
+    """Проверяет, включены ли магические числа в конфигурации"""
+    config = load_config()
+    return config.get('features', {}).get('use_magic_numbers', True)
+
+async def proceed_to_questions_or_magic_number(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                              chat_id: int, success_message: str) -> None:
+    """
+    Переходит либо к магическому числу, либо сразу к вопросам (в зависимости от настройки)
+    
+    :param update: Объект обновления от Telegram
+    :param context: Контекст бота
+    :param chat_id: ID чата
+    :param success_message: Сообщение для отправки пользователю
+    """
+    if is_magic_numbers_enabled():
+        # Стандартный поток - просим магическое число
+        set_state(chat_id, UserState.WAITING_MAGIC_NUMBER)
+        success_msg = await update.message.reply_text(success_message)
+        add_message_to_delete(chat_id, success_msg.message_id)
+    else:
+        # Пропускаем магическое число - переходим сразу к вопросам
+        session_data = get_user_data(chat_id)
+        magic_number = int(time.time() * 1000) % 999 + 1  # Используем время сервера как случайное число когда магические числа отключены
+        
+        # Обновляем данные сессии
+        update_data(chat_id, 'magic_number', magic_number)
+        
+        # Переходим сразу к предварительным вопросам
+        await start_preliminary_questions(update, context, chat_id)
+
+async def start_preliminary_questions(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """
+    Начинает процесс предварительных вопросов для расклада
+    
+    :param update: Объект обновления от Telegram
+    :param context: Контекст бота
+    :param chat_id: ID чата
+    """
+    try:
+        session_data = get_user_data(chat_id)
+        spread_type = session_data.get('spread_type')
+        magic_number = session_data.get('magic_number', int(time.time() * 1000) % 999 + 1)
+        
+        # Получаем предварительные вопросы для расклада
+        spread_config_type = SPREAD_MAPPING.get(spread_type, spread_type)
+        questions = get_questions_for_spread(spread_config_type)
+        
+        if questions and len(questions.questions) > 0:
+            # Есть предварительные вопросы - начинаем их задавать
+            update_data(chat_id, 'questions', questions)
+            update_data(chat_id, 'current_question', 0)
+            update_data(chat_id, 'preliminary_answers', [])
+            set_state(chat_id, UserState.WAITING_PRELIMINARY_ANSWERS)
+            
+            first_question = questions.questions[0]
+            
+            if is_magic_numbers_enabled():
+                # Стандартное сообщение с магическим числом
+                intro_text = f"✅ Магическое число {magic_number} принято!\n\n"
+            else:
+                # Сообщение без упоминания магического числа
+                intro_text = "✅ Приступаем к анализу!\n\n"
+            
+            await update.message.reply_text(
+                f"{intro_text}"
+                f"🎴 {questions.name}\n"
+                f"Рекомендуемое время: {questions.estimated_time}\n\n"
+                "Для более точной интерпретации ответьте на несколько вопросов:\n\n"
+                f"**{first_question.text}**\n\n"
+                f"💡 {first_question.hint}",
+                parse_mode='Markdown'
+            )
+            
+            logger.info(f"Начат процесс предварительных вопросов для пользователя {chat_id}, расклад {spread_type}")
+        else:
+            # Нет вопросов - сразу к LLM интерпретации
+            tariff = session_data.get('tariff', 'beginner')
+            await start_llm_interpretation(update, context, chat_id, session_data, tariff)
+            
+    except Exception as e:
+        logger.error(f"Ошибка при запуске предварительных вопросов для пользователя {chat_id}: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при подготовке расклада. Попробуйте позже."
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -43,22 +131,34 @@ SPREAD_MAPPING = {
 }
 
 
-async def perform_spread(update, context, spread_type, magic_number):
+async def perform_spread(update, context, spread_type, magic_number, tariff='beginner'):
     """
     Выполняет полный цикл генерации расклада:
-    1. Загрузка конфигурации
-    2. Выбор карт  
-    3. Генерация изображения
-    4. Отправка пользователю
-    5. Обработка ошибок
+    1. Списывание кредита с выбранного тарифа
+    2. Загрузка конфигурации
+    3. Выбор карт  
+    4. Генерация изображения
+    5. Отправка пользователю
+    6. Обработка ошибок
     
     :param update: Объект обновления от Telegram
     :param context: Контекст бота
     :param spread_type: Тип расклада (например, 'single_card')
     :param magic_number: Магическое число для генерации
+    :param tariff: Выбранный тариф таролога ('beginner' или 'expert')
     """
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     session_data = get_user_data(chat_id)
+    
+    # Списываем кредит с выбранного тарифа
+    if not use_credit(user_id, tariff):
+        error_msg = await update.message.reply_text(
+            f"❌ Не удалось списать кредит с тарифа {tariff}. У вас недостаточно раскладов.",
+            reply_markup=main_menu()
+        )
+        logger.error(f"Не удалось списать кредит с тарифа {tariff} для пользователя {user_id}")
+        return
     
     try:
         # 1. Загрузка конфигурации расклада (используем mapping)
@@ -218,65 +318,46 @@ async def handle_spreads_list(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_spread_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обрабатывает выбор конкретного расклада
-    Проверяет существование пользователя и запускает соответствующий поток
+    Обрабатывает выбор конкретного расклада - теперь показывает выбор тарифа таролога
     
     :param update: Объект обновления от Telegram
     :param context: Контекст бота
     """
     try:
         query = update.callback_query
-        chat_id = query.message.chat.id
+        user_id = query.from_user.id
         spread_type = query.data
         
         # Определяем название выбранного расклада
         spread_name = SPREAD_NAMES.get(spread_type, "Неизвестный расклад")
         
-        logger.info(f"Пользователь {chat_id} выбрал расклад: {spread_name}")
+        logger.info(f"Пользователь {user_id} выбрал расклад: {spread_name}")
         
-        # Проверяем существует ли пользователь в хранилище
-        if user_exists(chat_id):
-            # Существующий пользователь - приветствуем по имени и сразу к магическому числу
-            user_data = get_user(chat_id)
-            
-            if user_data:
-                # Устанавливаем состояние ожидания магического числа
-                set_state(chat_id, UserState.WAITING_MAGIC_NUMBER, {
-                    'spread_type': spread_type,
-                    'name': user_data['name'],
-                    'age': user_data['age']
-                })
-                
-                await query.edit_message_text(
-                    f"🔮 Привет снова, {user_data['name']}!\n\n"
-                    f"🎴 Расклад: {spread_name}\n"
-                    f"👤 Возраст: {user_data['age']} лет\n\n"
-                    "Сосредоточьтесь на своём вопросе и введите магическое число от 1 до 999:"
-                )
-                
-                logger.info(f"Возвращающийся пользователь {chat_id} ({user_data['name']}) перешёл к магическому числу")
-            else:
-                # Ошибка получения данных пользователя
-                await query.edit_message_text(
-                    "❌ Ошибка загрузки ваших данных.\nПопробуйте перезапустить бота командой /start",
-                    reply_markup=back_button("back_to_main")
-                )
-                logger.error(f"Не удалось загрузить данные существующего пользователя {chat_id}")
-        else:
-            # Новый пользователь - начинаем процесс регистрации
-            set_state(chat_id, UserState.WAITING_NAME, {'spread_type': spread_type})
-            
-            await query.edit_message_text(
-                f"✨ Добро пожаловать в мир Таро!\n\n"
-                f"🎴 Вы выбрали расклад: {spread_name}\n\n"
-                "Для персонализации расклада мне нужно узнать вас лучше.\n\n"
-                "👤 Как вас зовут?"
-            )
-            
-            logger.info(f"Новый пользователь {chat_id} начал регистрацию для расклада {spread_name}")
+        # Получаем кредиты пользователя для показа в меню выбора тарифа
+        credits = get_user_credits(user_id)
+        if credits is None:
+            # Новый пользователь - устанавливаем начальные кредиты из конфигурации
+            config = load_config()
+            tariff_plans = config.get('tariff_plans', {})
+            credits = {
+                'beginner': tariff_plans.get('beginner', {}).get('initial_credits', 3),
+                'expert': tariff_plans.get('expert', {}).get('initial_credits', 1)
+            }
+        
+        # Показываем меню выбора тарифа
+        config = load_config()
+        await query.edit_message_text(
+            f"🎴 **{spread_name}**\n\n"
+            "🔮 Выберите уровень таролога:\n\n"
+            "_Различные тарологи дают разные по глубине и стилю интерпретации._",
+            reply_markup=tariff_selection_menu(spread_type, credits, config),
+            parse_mode='Markdown'
+        )
+        
+        logger.info(f"Пользователю {user_id} показано меню выбора тарифа для расклада {spread_name}")
         
     except Exception as e:
-        logger.error(f"Ошибка в handle_spread_selection для пользователя {update.callback_query.message.chat.id}: {e}")
+        logger.error(f"Ошибка в handle_spread_selection для пользователя {update.callback_query.from_user.id}: {e}")
         try:
             await update.callback_query.edit_message_text(
                 "❌ Произошла ошибка при выборе расклада.\nПопробуйте начать заново:",
@@ -351,6 +432,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await feedback_system.cancel_feedback(update, context)
         elif callback_data.startswith("feedback_"):
             await handle_feedback(update, context)
+        elif callback_data == "my_credits":
+            # Просмотр кредитов пользователя
+            await handle_my_credits(update, context)
+        elif callback_data.startswith("tariff_"):
+            # Выбор тарифа для расклада
+            await handle_tariff_selection(update, context)
+        elif callback_data == "refill_info":
+            # Информация о пополнении
+            await handle_refill_info(update, context)
         else:
             # Неизвестный callback
             await query.edit_message_text(
@@ -434,22 +524,32 @@ async def process_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         if not is_valid:
             # Имя некорректно - показываем ошибку и просим ввести заново
-            await update.message.reply_text(
+            error_msg = await update.message.reply_text(
                 f"❌ {result}\n\n"
                 "👤 Попробуйте ещё раз. Как вас зовут?"
             )
+            add_message_to_delete(chat_id, error_msg.message_id)
             logger.info(f"Некорректное имя от пользователя {chat_id}: {result}")
             return
         
         # Имя корректно - сохраняем и переходим к дате рождения
         update_data(chat_id, 'name', result)
+        
+        # Сохраняем Telegram информацию пользователя для логов
+        user = update.effective_user
+        update_data(chat_id, 'user_id', user.id)
+        update_data(chat_id, 'telegram_username', user.username)
+        update_data(chat_id, 'telegram_first_name', user.first_name)
+        update_data(chat_id, 'telegram_last_name', user.last_name)
+        
         set_state(chat_id, UserState.WAITING_BIRTHDATE)
         
-        await update.message.reply_text(
+        success_msg = await update.message.reply_text(
             f"✅ Приятно познакомиться, {result}!\n\n"
             "📅 Введите дату рождения в формате ДД.ММ.ГГГГ\n"
             "(например: 15.03.1990):"
         )
+        add_message_to_delete(chat_id, success_msg.message_id)
         
         logger.info(f"Имя сохранено для пользователя {chat_id}: {result}")
         
@@ -478,36 +578,65 @@ async def process_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         
         if not is_valid:
             # Дата некорректна - показываем ошибку и просим ввести заново
-            await update.message.reply_text(
+            error_msg = await update.message.reply_text(
                 f"❌ {result}\n\n"
                 "📅 Попробуйте ещё раз. Введите дату рождения в формате ДД.ММ.ГГГГ\n"
                 "(например: 15.03.1990):"
             )
+            add_message_to_delete(chat_id, error_msg.message_id)
             logger.info(f"Некорректная дата от пользователя {chat_id}: {result}")
             return
         
         # Дата корректна - сохраняем пользователя в базу и переходим к магическому числу
         session_data = get_user_data(chat_id)
         
-        # Сохраняем пользователя в хранилище
-        success = save_user(chat_id, session_data['name'], result['date'])
+        # Сохраняем пользователя в хранилище (теперь с user_id и telegram данными)
+        user = update.message.from_user
+        success = save_user(
+            chat_id=chat_id,
+            user_id=user.id, 
+            name=session_data['name'], 
+            birthdate=result['date'],
+            telegram_username=user.username,
+            telegram_first_name=user.first_name,
+            telegram_last_name=user.last_name
+        )
         
         if not success:
-            await update.message.reply_text(
+            error_msg = await update.message.reply_text(
                 "❌ Ошибка сохранения данных. Попробуйте позже или обратитесь к /start"
             )
+            add_message_to_delete(chat_id, error_msg.message_id)
             logger.error(f"Не удалось сохранить пользователя {chat_id}")
             return
         
         # Обновляем данные в сессии
         update_data(chat_id, 'birthdate', result['date'])
         update_data(chat_id, 'age', result['age'])
-        set_state(chat_id, UserState.WAITING_MAGIC_NUMBER)
         
-        await update.message.reply_text(
-            f"✅ Спасибо! Ваш возраст: {result['age']} лет.\n\n"
-            "🔮 Теперь сосредоточьтесь на своём вопросе и введите магическое число от 1 до 999:"
-        )
+        # СПИСЫВАЕМ КРЕДИТ ДЛЯ НОВОГО ПОЛЬЗОВАТЕЛЯ
+        tariff_key = session_data.get('tariff', 'beginner')
+        if not use_credit(user.id, tariff_key):
+            error_msg = await update.message.reply_text(
+                "❌ Ошибка при списании кредита. Попробуйте позже.",
+            )
+            add_message_to_delete(chat_id, error_msg.message_id)
+            logger.error(f"Не удалось списать кредит для нового пользователя {user.id}")
+            return
+        
+        # Переходим к следующему шагу (магическое число или сразу к вопросам)
+        if is_magic_numbers_enabled():
+            success_message = (
+                f"✅ Спасибо! Ваш возраст: {result['age']} лет.\n\n"
+                "🔮 Теперь сосредоточьтесь на своём вопросе и введите магическое число от 1 до 999:"
+            )
+        else:
+            success_message = (
+                f"✅ Спасибо! Ваш возраст: {result['age']} лет.\n\n"
+                "🔮 Готовимся к анализу вашего расклада..."
+            )
+        
+        await proceed_to_questions_or_magic_number(update, context, chat_id, success_message)
         
         logger.info(f"Пользователь {chat_id} сохранён, возраст: {result['age']}")
         
@@ -528,6 +657,8 @@ async def process_magic_number(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         chat_id = update.effective_chat.id
         user_input = update.message.text.strip()
+        session_data = get_user_data(chat_id)
+        tariff = session_data.get('tariff', 'beginner')  # Получаем выбранный тариф
         
         logger.info(f"Пользователь {chat_id} ввёл магическое число: {user_input}")
         
@@ -576,7 +707,7 @@ async def process_magic_number(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.info(f"Начат процесс предварительных вопросов для пользователя {chat_id}, расклад {spread_type}")
         else:
             # Нет предварительных вопросов - сразу переходим к LLM интерпретации
-            await start_llm_interpretation(update, context, chat_id, session_data)
+            await start_llm_interpretation(update, context, chat_id, session_data, tariff)
         
     except Exception as e:
         logger.error(f"Ошибка в process_magic_number для пользователя {update.effective_chat.id}: {e}")
@@ -603,8 +734,9 @@ async def process_preliminary_answers(update: Update, context: ContextTypes.DEFA
         
         if not questions or current_question_index >= len(questions.questions):
             # Ошибка состояния - переходим к финализации
+            tariff = session_data.get('tariff', 'beginner')  # Получаем выбранный тариф
             logger.error(f"Некорректное состояние вопросов для пользователя {chat_id}")
-            await start_llm_interpretation(update, context, chat_id, session_data)
+            await start_llm_interpretation(update, context, chat_id, session_data, tariff)
             return
         
         # Сохраняем текущий ответ
@@ -636,13 +768,9 @@ async def process_preliminary_answers(update: Update, context: ContextTypes.DEFA
                 parse_mode='Markdown'
             )
         else:
-            # Все вопросы завершены - переходим к генерации расклада
-            await update.message.reply_text(
-                "✅ Спасибо за подробные ответы!\n\n"
-                "🎨 Теперь создаю ваш персональный расклад..."
-            )
-            
-            await start_llm_interpretation(update, context, chat_id, session_data)
+            # Все вопросы завершены - переходим к генерации (без лишних сообщений)
+            tariff = session_data.get('tariff', 'beginner')  # Получаем выбранный тариф
+            await start_llm_interpretation(update, context, chat_id, session_data, tariff)
         
     except Exception as e:
         logger.error(f"Ошибка в process_preliminary_answers для пользователя {update.effective_chat.id}: {e}")
@@ -675,8 +803,9 @@ async def finalize_spread_generation(update: Update, context: ContextTypes.DEFAU
         # Проверяем, реализован ли данный расклад
         if spread_type in IMPLEMENTED_SPREADS:
             # Генерируем готовый расклад
-            logger.info(f"Генерируем реализованный расклад {spread_type} для пользователя {chat_id}")
-            await perform_spread(update, context, spread_type, magic_number)
+            tariff = session_data.get('tariff', 'beginner')  # Получаем выбранный тариф
+            logger.info(f"Генерируем реализованный расклад {spread_type} (тариф: {tariff}) для пользователя {chat_id}")
+            await perform_spread(update, context, spread_type, magic_number, tariff)
         else:
             # Для неготовых раскладов показываем заглушку
             spread_name = SPREAD_NAMES.get(spread_type, 'Неизвестный расклад')
@@ -742,6 +871,203 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
     except Exception as e:
         logger.error(f"Ошибка при обработке обратной связи: {e}")
+
+
+async def handle_my_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показывает пользователю информацию о доступных кредитах
+    """
+    try:
+        query = update.callback_query
+        user_id = query.from_user.id
+        config = load_config()
+        tariff_plans = config.get('tariff_plans', {})
+        
+        # Получаем кредиты пользователя
+        credits = get_user_credits(user_id)
+        if credits is None:
+            await query.edit_message_text(
+                "❌ Вы не зарегистрированы. Сначала сделайте расклад.",
+                reply_markup=back_button("back_to_main")
+            )
+            return
+        
+        # Формируем сообщение с описанием тарифов
+        text = "💰 Ваши доступные расклады:\n\n"
+        
+        for tariff_key, plan_info in tariff_plans.items():
+            name = plan_info.get('name', tariff_key)
+            description = plan_info.get('description', '')
+            icon = plan_info.get('icon', '🔮')
+            available = credits.get(tariff_key, 0)
+            
+            text += f"{icon} **{name}**\n"
+            text += f"_{description}_\n"
+            text += f"📊 Доступно: **{available}** расклад(ов)\n\n"
+        
+        limitations = config.get('limitations', {})
+        if not limitations.get('refill_available', False):
+            text += f"ℹ️ {limitations.get('refill_message', 'Пополнение недоступно')}"
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=credits_info_menu(),
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе кредитов пользователя {query.from_user.id}: {e}")
+        await query.edit_message_text(
+            "❌ Произошла ошибка при загрузке информации о кредитах",
+            reply_markup=back_button("back_to_main")
+        )
+
+
+async def handle_tariff_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает выбор тарифа для расклада
+    """
+    try:
+        query = update.callback_query
+        user_id = query.from_user.id
+        chat_id = query.message.chat.id
+        callback_data = query.data
+        
+        # Парсим callback: tariff_{tariff_key}_{spread_type}
+        parts = callback_data.split('_')
+        if len(parts) < 3:
+            await query.edit_message_text(
+                "❌ Неверный формат команды",
+                reply_markup=back_button("back_to_main")
+            )
+            return
+        
+        if parts[1] == 'empty':
+            # Недоступный тариф
+            config = load_config()
+            limitations = config.get('limitations', {})
+            message = limitations.get('refill_message', 'У вас недостаточно кредитов на этом тарифе')
+            
+            await query.edit_message_text(
+                f"❌ {message}",
+                reply_markup=back_button("spreads_list")
+            )
+            return
+        
+        tariff_key = parts[1]  # beginner или expert
+        spread_type = '_'.join(parts[2:])  # spread_celtic, spread_single, etc.
+        
+        # Сохраняем выбранный тариф и переходим к сбору данных пользователя
+        spread_name = SPREAD_NAMES.get(spread_type, "Неизвестный расклад")
+        
+        # Проверяем существует ли пользователь
+        if user_exists(user_id=user_id):
+            # Существующий пользователь - проверяем кредиты
+            if not has_credits(user_id, tariff_key):
+                await query.edit_message_text(
+                    "❌ У вас недостаточно кредитов на выбранном тарифе",
+                    reply_markup=back_button("spreads_list")
+                )
+                return
+            
+            # СПИСЫВАЕМ КРЕДИТ СРАЗУ ПОСЛЕ ВЫБОРА ТАРИФА
+            if not use_credit(user_id, tariff_key):
+                await query.edit_message_text(
+                    "❌ Ошибка при списании кредита. Попробуйте позже.",
+                    reply_markup=back_button("spreads_list")
+                )
+                return
+            
+            # Переходим к следующему шагу (магическое число или сразу к вопросам)
+            user_data = get_user(user_id=user_id)
+            if user_data:
+                # Обновляем данные сессии
+                set_state(chat_id, UserState.IDLE, {  # Временно устанавливаем IDLE
+                    'spread_type': spread_type,
+                    'tariff': tariff_key,
+                    'name': user_data['name'],
+                    'age': user_data['age']
+                })
+                
+                config = load_config()
+                tariff_name = config['tariff_plans'][tariff_key]['name']
+                
+                if is_magic_numbers_enabled():
+                    # Стандартный поток - просим магическое число
+                    set_state(chat_id, UserState.WAITING_MAGIC_NUMBER)
+                    await query.edit_message_text(
+                        f"🔮 Привет снова, {user_data['name']}!\n\n"
+                        f"🎴 Расклад: {spread_name}\n"
+                        f"✨ Таролог: {tariff_name}\n"
+                        f"👤 Возраст: {user_data['age']} лет\n\n"
+                        "Сосредоточьтесь на своём вопросе и введите магическое число от 1 до 999:"
+                    )
+                else:
+                    # Пропускаем магическое число - переходим сразу к вопросам
+                    update_data(chat_id, 'magic_number', 1)
+                    
+                    await query.edit_message_text(
+                        f"🔮 Привет снова, {user_data['name']}!\n\n"
+                        f"🎴 Расклад: {spread_name}\n"
+                        f"✨ Таролог: {tariff_name}\n"
+                        f"👤 Возраст: {user_data['age']} лет\n\n"
+                        "✅ Готовимся к анализу..."
+                    )
+                    
+                    # Создаем псевдо-update для start_preliminary_questions
+                    # (функция ожидает message, но мы можем имитировать)
+                    from types import SimpleNamespace
+                    fake_update = SimpleNamespace()
+                    fake_update.message = SimpleNamespace()
+                    fake_update.message.reply_text = lambda text, **kwargs: query.message.reply_text(text, **kwargs)
+                    
+                    await start_preliminary_questions(fake_update, context, chat_id)
+            else:
+                await query.edit_message_text(
+                    "❌ Ошибка загрузки данных",
+                    reply_markup=back_button("back_to_main")
+                )
+        else:
+            # Новый пользователь - начинаем регистрацию
+            set_state(chat_id, UserState.WAITING_NAME, {
+                'spread_type': spread_type,
+                'tariff': tariff_key
+            })
+            
+            await query.edit_message_text(
+                f"🌟 Добро пожаловать!\n\n"
+                f"🎴 Расклад: {spread_name}\n\n"
+                "Давайте познакомимся! Как вас зовут?\n"
+                "💡 Введите ваше имя (от 2 до 50 символов):"
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при выборе тарифа: {e}")
+        await query.edit_message_text(
+            "❌ Произошла ошибка при выборе тарифа",
+            reply_markup=back_button("spreads_list")
+        )
+
+
+async def handle_refill_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показывает информацию о пополнении кредитов
+    """
+    try:
+        query = update.callback_query
+        config = load_config()
+        limitations = config.get('limitations', {})
+        
+        message = limitations.get('refill_message', 'В настоящее время возможность пополнить количество раскладов отсутствует.')
+        
+        await query.edit_message_text(
+            f"ℹ️ **Информация о пополнении**\n\n{message}",
+            reply_markup=back_button("spreads_list"),
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе информации о пополнении: {e}")
 
 
 # Для совместимости с существующим кодом

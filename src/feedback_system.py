@@ -90,8 +90,17 @@ class FeedbackSystem:
         except Exception as e:
             logger.error(f"Ошибка при запросе обратной связи: {e}")
     
+    def create_feedback_after_rating_keyboard(self, rating: int) -> InlineKeyboardMarkup:
+        """Создает клавиатуру после выбора рейтинга"""
+        keyboard = [
+            [InlineKeyboardButton("💬 Оставить комментарий", callback_data="feedback_comment")],
+            [InlineKeyboardButton("🔄 Новый расклад", callback_data="spreads_list")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
     async def handle_rating(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает рейтинг от пользователя"""
+        """Обрабатывает рейтинг от пользователя (ОСТАВЛЯЕМ КНОПКУ КОММЕНТАРИЯ)"""
         try:
             query = update.callback_query
             chat_id = query.message.chat.id
@@ -104,29 +113,41 @@ class FeedbackSystem:
             session_data = get_user_data(chat_id)
             log_filepath = session_data.get('log_filepath')
             
+            # Сохраняем рейтинг в сессии
+            update_data(chat_id, 'user_rating', rating)
+            
             if log_filepath:
                 # Сохраняем рейтинг в лог
                 spread_logger = get_spread_logger()
                 spread_logger.add_feedback(log_filepath, rating)
             
-            # Благодарим пользователя
+            # Благодарим пользователя, НО ОСТАВЛЯЕМ КОММЕНТАРИЙ
             thank_you_message = self.THANK_YOU_MESSAGES.get(rating, "Спасибо за отзыв!")
             rating_emoji = self.RATING_EMOJIS.get(rating, "⭐")
             
             response_message = (
                 f"{thank_you_message}\n\n"
                 f"Ваша оценка: {rating_emoji}\n\n"
-                "✨ Возвращайтесь за новыми раскладами!"
+                "💬 Вы можете также оставить комментарий."
             )
             
-            # Обновляем сообщение
-            await query.edit_message_text(
-                response_message,
-                reply_markup=main_menu()
-            )
-            
-            # Очищаем состояние
-            reset_to_idle(chat_id, keep_data=False)
+            # Проверяем, есть ли уже комментарий
+            existing_comment = session_data.get('user_comment')
+            if existing_comment:
+                # У пользователя уже есть и рейтинг, и комментарий
+                response_message += f"\n✨ Спасибо за полную оценку! Возвращайтесь за новыми раскладами!"
+                await query.edit_message_text(
+                    response_message,
+                    reply_markup=main_menu()
+                )
+                # Очищаем состояние
+                reset_to_idle(chat_id, keep_data=False)
+            else:
+                # Обновляем сообщение С КНОПКОЙ КОММЕНТАРИЯ
+                await query.edit_message_text(
+                    response_message,
+                    reply_markup=self.create_feedback_after_rating_keyboard(rating)
+                )
             
             logger.info(f"Получена оценка {rating} от пользователя {chat_id}")
             
@@ -166,8 +187,24 @@ class FeedbackSystem:
         except Exception as e:
             logger.error(f"Ошибка при запросе комментария: {e}")
     
+    def create_feedback_after_comment_keyboard(self) -> InlineKeyboardMarkup:
+        """Создаёт клавиатуру после комментария"""
+        keyboard = [
+            # Первый ряд: звезды 1-3
+            [InlineKeyboardButton("⭐", callback_data="rate_1"),
+             InlineKeyboardButton("⭐⭐", callback_data="rate_2"), 
+             InlineKeyboardButton("⭐⭐⭐", callback_data="rate_3")],
+            # Второй ряд: звезды 4-5
+            [InlineKeyboardButton("⭐⭐⭐⭐", callback_data="rate_4"),
+             InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data="rate_5")],
+            # Третий ряд: навигация
+            [InlineKeyboardButton("🔄 Новый расклад", callback_data="spreads_list")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
     async def handle_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает текстовый комментарий"""
+        """Обрабатывает текстовый комментарий (ОСТАВЛЯЕМ КНОПКИ ОЦЕНКИ)"""
         try:
             chat_id = update.effective_chat.id
             comment = update.message.text.strip()
@@ -176,27 +213,39 @@ class FeedbackSystem:
             session_data = get_user_data(chat_id)
             log_filepath = session_data.get('log_filepath')
             
+            # Сохраняем комментарий в сессию
+            update_data(chat_id, 'user_comment', comment)
+            
             if log_filepath:
                 # Сохраняем комментарий в лог (рейтинг 0 = только комментарий)
                 spread_logger = get_spread_logger()
                 spread_logger.add_feedback(log_filepath, 0, comment)
             
-            # Благодарим за комментарий
+            # Благодарим за комментарий, НО ОСТАВЛЯЕМ ОЦЕНКУ
             response_message = (
                 "💝 **Спасибо за подробный отзыв!**\n\n"
-                "Ваш комментарий очень ценен для меня. Я обязательно учту ваши пожелания "
-                "при улучшении интерпретаций.\n\n"
-                "✨ Возвращайтесь за новыми раскладами!"
+                "Ваш комментарий очень ценен для меня.\n\n"
+                "⭐ Вы можете также поставить оценку:"
             )
             
             await update.message.reply_text(
                 response_message,
-                reply_markup=main_menu(),
+                reply_markup=self.create_feedback_after_comment_keyboard(),
                 parse_mode='Markdown'
             )
             
-            # Очищаем состояние
-            reset_to_idle(chat_id, keep_data=False)
+            # Проверяем, есть ли уже рейтинг
+            existing_rating = session_data.get('user_rating')
+            if existing_rating:
+                # У пользователя уже есть и рейтинг, и комментарий
+                rating_emoji = self.RATING_EMOJIS.get(existing_rating, "⭐")
+                response_message += f"\nВаша оценка: {rating_emoji}\n\n✨ Спасибо за полную оценку! Возвращайтесь за новыми раскладами!"
+                # Обновляем последнее сообщение (найдём его)
+                # Очищаем состояние
+                reset_to_idle(chat_id, keep_data=False)
+            else:
+                # НЕ очищаем состояние, оставляем WAITING_FEEDBACK
+                set_state(chat_id, UserState.WAITING_FEEDBACK)  # возвращаемся к ожиданию обратной связи
             
             logger.info(f"Получен комментарий от пользователя {chat_id}: {comment[:50]}...")
             

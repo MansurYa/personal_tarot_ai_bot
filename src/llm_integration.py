@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes
 
 from src.llm_session import LLMSession, InterpretationStage
 from src.prompt_manager import PromptManager
-from src.simple_state import UserState, set_state, get_user_data, update_data, reset_to_idle
+from src.simple_state import UserState, set_state, get_user_data, update_data, reset_to_idle, get_messages_to_delete, clear_messages_to_delete
 from src.card_manager import TarotDeck, select_cards
 from src.image_generator import ImageGenerator
 from src.spread_configs import get_spread_config
@@ -33,7 +33,7 @@ def get_prompt_manager():
     if _prompt_manager is None:
         _prompt_manager = PromptManager(
             prompts_dir="prompts",
-            tarot_cards_file="assets/tarot-cards-images-info.json"
+            tarot_cards_file="assets/tarot-cards-images-info-ru.json"
         )
     return _prompt_manager
 
@@ -53,9 +53,15 @@ def get_tarot_deck():
 
 
 async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                 chat_id: int, session_data: dict) -> None:
+                                 chat_id: int, session_data: dict, tariff: str = "beginner") -> None:
     """
     Запускает процесс LLM интерпретации после получения всех предварительных данных
+    
+    :param update: Telegram Update объект
+    :param context: Telegram Context объект
+    :param chat_id: ID чата пользователя
+    :param session_data: Данные сессии пользователя
+    :param tariff: Выбранный тариф ("beginner" или "expert")
     """
     try:
         spread_type = session_data.get('spread_type')
@@ -67,6 +73,7 @@ async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT
         # Создаем прогресс-бар СРАЗУ после ответов на предварительные вопросы
         progress_bar = await create_progress_bar(update, context)
         progress_manager = InterpretationProgress(progress_bar)
+        progress_manager.set_update_context(update, context)  # Сохраняем контекст для пересоздания
         await progress_manager.start_preparation()  # 0% - Подготавливаю расклад...
         
         # Подготавливаем данные для LLM
@@ -75,18 +82,37 @@ async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT
             'age': session_data.get('age')
         }
         
-        # Генерируем данные расклада БЕЗ отправки изображения
-        spread_result = await generate_spread_image(spread_type, magic_number, chat_id)
-        if not spread_result:
+        # ОТКЛАДЫВАЕМ генерацию изображения до финальной стадии - только подготавливаем данные
+        
+        # Маппинг callback названий в конфигурационные названия
+        SPREAD_MAPPING = {
+            'spread_single': 'single_card',
+            'spread_three': 'three_cards', 
+            'spread_horseshoe': 'horseshoe',
+            'spread_love': 'love_triangle',
+            'spread_celtic': 'celtic_cross',
+            'spread_week': 'week_forecast',
+            'spread_year': 'year_wheel'
+        }
+        
+        # Подготавливаем данные для генерации карт (но не генерируем изображение)
+        mapped_spread_type = SPREAD_MAPPING.get(spread_type, spread_type)
+        
+        # Выбираем карты без создания изображения
+        from src.spread_configs import get_spread_config
+        spread_config = get_spread_config(mapped_spread_type)
+        if not spread_config:
             await progress_bar.cancel()
-            await update.message.reply_text("❌ Ошибка при создании расклада. Попробуйте позже.")
+            await update.message.reply_text("❌ Ошибка конфигурации расклада. Попробуйте позже.")
             return
             
-        # Сохраняем данные расклада (БЕЗ отправки изображения пользователю)
-        image_bytes, selected_cards, positions = spread_result
+        tarot_deck = get_tarot_deck()
+        selected_cards = select_cards(tarot_deck, spread_config['card_count'], magic_number, chat_id)
+        
+        # Сохраняем данные расклада (изображение создадим в финале)
         update_data(chat_id, 'selected_cards', selected_cards)
-        update_data(chat_id, 'positions', positions)
-        update_data(chat_id, 'image_bytes', image_bytes)  # Сохраняем для отправки в финале
+        update_data(chat_id, 'positions', spread_config['positions']) 
+        update_data(chat_id, 'spread_config', spread_config)  # Сохраняем конфигурацию для генерации позже
         
         # Создаем лог расклада
         spread_logger = get_spread_logger()
@@ -100,7 +126,11 @@ async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT
             spread_name=spread_name,
             magic_number=session_data.get('magic_number'),
             selected_cards=selected_cards,
-            positions=positions
+            positions=spread_config['positions'],
+            telegram_username=session_data.get('telegram_username'),
+            telegram_first_name=session_data.get('telegram_first_name'),
+            telegram_last_name=session_data.get('telegram_last_name'),
+            user_id=session_data.get('user_id')
         )
         
         # Сохраняем путь к логу для дальнейшего использования
@@ -112,28 +142,22 @@ async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT
             preliminary_answers = session_data.get('preliminary_answers', [])
             spread_logger.update_preliminary_questions(log_filepath, preliminary_questions, preliminary_answers)
         
-        # Маппинг callback названий в конфигурационные названия
-        SPREAD_MAPPING = {
-            'spread_single': 'single_card',
-            'spread_three': 'three_cards', 
-            'spread_horseshoe': 'horseshoe',
-            'spread_love': 'love_triangle',
-            'spread_celtic': 'celtic_cross',
-            'spread_week': 'week_forecast',
-            'spread_year': 'year_wheel'
-        }
-        
         # Подготавливаем данные расклада для LLM
-        mapped_spread_type = SPREAD_MAPPING.get(spread_type, spread_type)
         spread_data = {
             'spread_type': mapped_spread_type,
             'cards': selected_cards,
-            'positions': positions,
+            'positions': spread_config['positions'],
             'questions': [q.text for q in session_data.get('questions', {}).questions] if session_data.get('questions') else []
         }
         
-        # Создаем LLM сессию
-        llm_session = LLMSession(get_prompt_manager())
+        # Получаем модель для выбранного тарифа
+        config = load_config()
+        tariff_plans = config.get('tariff_plans', {})
+        tariff_info = tariff_plans.get(tariff, tariff_plans.get('beginner', {}))
+        model_name = tariff_info.get('model_name', 'deepseek/deepseek-chat-v3-0324:free')
+        
+        # Создаем LLM сессию с выбранной моделью
+        llm_session = LLMSession(get_prompt_manager(), model_name=model_name)
         update_data(chat_id, 'llm_session', llm_session)
         
         # Запускаем первую часть интерпретации
@@ -284,6 +308,11 @@ async def generate_interpretation_with_visual_progress(llm_session: LLMSession,
             spread_logger = get_spread_logger()
             spread_logger.start_llm_processing(log_filepath, llm_session.agent.model_name)
         
+        # Пересоздаем прогресс-бар после завершения всех вопросов для лучшей видимости
+        recreated = await progress_manager.recreate_progress_bar(25)
+        if not recreated:
+            await progress_manager.progress_bar.update_progress(25)
+        
         # Этап 1: 25-50% - Анализ контекста (промпт 04)
         await progress_manager.start_context_analysis()
         
@@ -317,16 +346,52 @@ async def generate_interpretation_with_visual_progress(llm_session: LLMSession,
         return None
 
 
+async def cleanup_chat_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Удаляет все промежуточные сообщения из чата"""
+    try:
+        messages_to_delete = get_messages_to_delete(chat_id)
+        if messages_to_delete:
+            logger.info(f"Удаляем {len(messages_to_delete)} промежуточных сообщений для чата {chat_id}")
+            
+            for message_id in messages_to_delete:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    await asyncio.sleep(0.1)  # Небольшая задержка между удалениями
+                except Exception as e:
+                    # Сообщение уже могло быть удалено или недоступно
+                    logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
+            
+            # Очищаем список после удаления
+            clear_messages_to_delete(chat_id)
+            logger.info(f"Очистка чата завершена для {chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке чата: {e}")
+
+
 async def send_final_interpretation_with_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                               chat_id: int, interpretation: str, session_data: dict) -> None:
     """Отправляет финальное сообщение с изображением и интерпретацией"""
     try:
-        # Получаем данные расклада
-        image_bytes = session_data.get('image_bytes')
+        # СНАЧАЛА ОЧИЩАЕМ ЧАТ ОТ ПРОМЕЖУТОЧНЫХ СООБЩЕНИЙ
+        await cleanup_chat_messages(update, context, chat_id)
+        # ГЕНЕРИРУЕМ ИЗОБРАЖЕНИЕ ТОЛЬКО СЕЙЧАС!
+        spread_config = session_data.get('spread_config')
         selected_cards = session_data.get('selected_cards', [])
         
-        # Создаем описание карт
-        cards_description = "Выпавшие карты:\n"
+        if spread_config and selected_cards:
+            # Генерируем изображение в финале
+            image_generator = get_image_generator()
+            image_bytes = image_generator.generate_spread_image(
+                background_id=spread_config['background_id'],
+                cards=selected_cards,
+                positions=spread_config['positions'], 
+                scale=spread_config['scale']
+            )
+        else:
+            image_bytes = None
+        
+        # Создаём описание карт
+        cards_description = "🎴 Выпавшие карты:\n"
         for i, card in enumerate(selected_cards, 1):
             cards_description += f"{i}. {card['name']}\n"
             
@@ -334,40 +399,112 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
         config = load_config()
         max_caption_length = 1024  # Telegram limit for captions
         
-        # Формат финального сообщения
-        full_message = f"🎴 {cards_description}\n🔮 Интерпретация:\n{interpretation}"
+        # Формат финального сообщения (убираем лишнюю строку "Интерпретация:")
+        full_message = f"🎴 {cards_description}\n{interpretation}"
         
-        if image_bytes:
-            if len(full_message) <= max_caption_length:
-                # Отправляем всё одним сообщением
-                await update.message.reply_photo(
-                    photo=image_bytes,
-                    caption=full_message
-                )
-            else:
-                # Отправляем изображение с кратким caption, а затем полную интерпретацию
-                await update.message.reply_photo(
-                    photo=image_bytes,
-                    caption=cards_description
-                )
-                await asyncio.sleep(0.3)
-                
-                # Отправляем интерпретацию отдельным сообщением
-                max_text_length = config.get("max_message_length", 4096)
-                interpretation_text = f"🔮 Интерпретация:\n\n{interpretation}"
-                
-                if len(interpretation_text) <= max_text_length:
-                    await update.message.reply_text(interpretation_text)
+        # Отправляем сообщения с увеличенным таймаутом и повторными попытками
+        from telegram.constants import ParseMode
+        from telegram.error import TimedOut, NetworkError
+        
+        MAX_RETRIES = 3
+        TIMEOUT = 60  # 60 секунд вместо стандартных 20
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                if image_bytes:
+                    if len(full_message) <= max_caption_length:
+                        # Отправляем всё одним сообщением
+                        await asyncio.wait_for(
+                            update.message.reply_photo(
+                                photo=image_bytes,
+                                caption=full_message,
+                                read_timeout=TIMEOUT,
+                                write_timeout=TIMEOUT,
+                                connect_timeout=TIMEOUT,
+                                pool_timeout=TIMEOUT
+                            ),
+                            timeout=TIMEOUT
+                        )
+                    else:
+                        # Отправляем изображение с кратким caption
+                        await asyncio.wait_for(
+                            update.message.reply_photo(
+                                photo=image_bytes,
+                                caption=cards_description,
+                                read_timeout=TIMEOUT,
+                                write_timeout=TIMEOUT,
+                                connect_timeout=TIMEOUT,
+                                pool_timeout=TIMEOUT
+                            ),
+                            timeout=TIMEOUT
+                        )
+                        await asyncio.sleep(0.3)
+                        
+                        # Отправляем интерпретацию отдельным сообщением
+                        max_text_length = config.get("max_message_length", 4096)
+                        interpretation_text = interpretation
+                        
+                        if len(interpretation_text) <= max_text_length:
+                            await asyncio.wait_for(
+                                update.message.reply_text(
+                                    interpretation_text,
+                                    read_timeout=TIMEOUT,
+                                    write_timeout=TIMEOUT,
+                                    connect_timeout=TIMEOUT,
+                                    pool_timeout=TIMEOUT
+                                ),
+                                timeout=TIMEOUT
+                            )
+                        else:
+                            # Разбиваем на части
+                            parts = split_long_message(interpretation_text, max_text_length)
+                            for i, part in enumerate(parts):
+                                await asyncio.wait_for(
+                                    update.message.reply_text(
+                                        part,
+                                        read_timeout=TIMEOUT,
+                                        write_timeout=TIMEOUT,
+                                        connect_timeout=TIMEOUT,
+                                        pool_timeout=TIMEOUT
+                                    ),
+                                    timeout=TIMEOUT
+                                )
+                                if i < len(parts) - 1:
+                                    await asyncio.sleep(0.5)
                 else:
-                    # Разбиваем на части
-                    parts = split_long_message(interpretation_text, max_text_length)
-                    for i, part in enumerate(parts):
-                        await update.message.reply_text(part)
-                        if i < len(parts) - 1:
-                            await asyncio.sleep(0.5)
-        else:
-            # Нет изображения - отправляем только текст
-            await update.message.reply_text(full_message)
+                    # Нет изображения - отправляем только текст
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            full_message,
+                            read_timeout=TIMEOUT,
+                            write_timeout=TIMEOUT,
+                            connect_timeout=TIMEOUT,
+                            pool_timeout=TIMEOUT
+                        ),
+                        timeout=TIMEOUT
+                    )
+                
+                # Если дошли сюда - отправка успешна
+                break
+                
+            except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"Попытка {attempt + 1} отправить сообщение пользователю {chat_id} не удалась: {e}. Повторяем...")
+                    await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
+                    continue
+                else:
+                    logger.error(f"Все попытки отправить сообщение пользователю {chat_id} исчерпаны: {e}")
+                    # Отправляем упрощенное уведомление
+                    try:
+                        await update.message.reply_text(
+                            "⚠️ Интерпретация готова, но произошла ошибка при отправке изображения. "
+                            "Попробуйте создать новый расклад.",
+                            read_timeout=30,
+                            write_timeout=30
+                        )
+                    except:
+                        pass
+                    return
             
         # Логируем завершение интерпретации
         log_filepath = session_data.get('log_filepath')
@@ -392,6 +529,15 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
         
     except Exception as e:
         logger.error(f"Ошибка при отправке финального сообщения пользователю {chat_id}: {e}")
+        # Уведомляем пользователя об ошибке
+        try:
+            await update.message.reply_text(
+                "❌ Произошла ошибка при отправке интерпретации. Попробуйте создать новый расклад.",
+                read_timeout=30,
+                write_timeout=30
+            )
+        except:
+            pass
 
 
 async def send_final_interpretation(update: Update, context: ContextTypes.DEFAULT_TYPE,

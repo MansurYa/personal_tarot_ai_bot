@@ -37,10 +37,25 @@ class SpreadLogger:
                          spread_name: str,
                          magic_number: int,
                          selected_cards: List[Dict],
-                         positions: List[str]) -> str:
+                         positions: List[str],
+                         telegram_username: str = None,
+                         telegram_first_name: str = None,
+                         telegram_last_name: str = None,
+                         user_id: int = None) -> str:
         """
         Создает начальный лог расклада
         
+        :param chat_id: ID чата пользователя
+        :param user_data: Данные пользователя (имя, возраст)
+        :param spread_type: Тип расклада
+        :param spread_name: Название расклада
+        :param magic_number: Магическое число
+        :param selected_cards: Выбранные карты
+        :param positions: Позиции карт
+        :param telegram_username: Telegram username пользователя
+        :param telegram_first_name: Имя в Telegram
+        :param telegram_last_name: Фамилия в Telegram
+        :param user_id: Telegram user ID
         :return: Путь к файлу лога
         """
         try:
@@ -54,7 +69,13 @@ class SpreadLogger:
                 "user": {
                     "name": user_data.get("name"),
                     "age": user_data.get("age"),
-                    "chat_id": chat_id
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "telegram": {
+                        "username": telegram_username,
+                        "first_name": telegram_first_name,
+                        "last_name": telegram_last_name
+                    }
                 },
                 "spread": {
                     "type": spread_type,
