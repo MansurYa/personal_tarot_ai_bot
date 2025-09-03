@@ -8,8 +8,9 @@ from typing import List, Optional, Dict, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from src.llm_session import LLMSession, InterpretationStage
+from src.llm_session import MultiStageLLMSession as LLMSession, InterpretationStage
 from src.prompt_manager import PromptManager
+from src.openrouter_client import TarotLLMAgent
 from src.simple_state import UserState, set_state, get_user_data, update_data, reset_to_idle, get_messages_to_delete, clear_messages_to_delete
 from src.card_manager import TarotDeck, select_cards
 from src.image_generator import ImageGenerator
@@ -156,8 +157,17 @@ async def start_llm_interpretation(update: Update, context: ContextTypes.DEFAULT
         tariff_info = tariff_plans.get(tariff, tariff_plans.get('beginner', {}))
         model_name = tariff_info.get('model_name', 'deepseek/deepseek-chat-v3-0324:free')
         
-        # Создаем LLM сессию с выбранной моделью
-        llm_session = LLMSession(get_prompt_manager(), model_name=model_name)
+        # Создаем TarotLLMAgent с выбранной моделью
+        api_key = config.get('openrouter_api_key')
+        agent = TarotLLMAgent(
+            model_name=model_name,
+            api_key=api_key,
+            max_tokens=config.get('max_response_tokens', 8000),
+            temperature=config.get('temperature', 0.3)
+        )
+        
+        # Создаем LLM сессию с агентом и prompt manager
+        llm_session = LLMSession(agent, get_prompt_manager())
         update_data(chat_id, 'llm_session', llm_session)
         
         # Запускаем первую часть интерпретации
@@ -301,7 +311,7 @@ async def generate_interpretation_with_visual_progress(llm_session: LLMSession,
                                                     llm_answers: List[str],
                                                     progress_manager: InterpretationProgress,
                                                     log_filepath: str = None) -> Optional[str]:
-    """Генерирует финальную интерпретацию с визуальным прогресс-баром"""
+    """Генерирует финальную интерпретацию с визуальным прогресс-баром (НОВАЯ МНОГОЭТАПНАЯ АРХИТЕКТУРА)"""
     try:
         # Логируем начало LLM обработки
         if log_filepath:
@@ -313,36 +323,37 @@ async def generate_interpretation_with_visual_progress(llm_session: LLMSession,
         if not recreated:
             await progress_manager.progress_bar.update_progress(25)
         
-        # Этап 1: 25-50% - Анализ контекста (промпт 04)
-        await progress_manager.start_context_analysis()
+        logger.info("🚀 Начинаем МНОГОЭТАПНУЮ интерпретацию...")
         
-        await llm_session.add_question_answers(llm_answers)
-        success = await llm_session.generate_context_analysis()
-        if not success:
-            return None
-            
+        # Этап 2: 25% → 50% - Анализ контекста (промпт 04) - ОТДЕЛЬНЫЙ запрос
+        await progress_manager.start_context_analysis()
+        logger.info("=== Этап 2: Анализ контекста ===")
+        
+        await llm_session.stage_2_context_analysis(llm_answers)
+        
         await progress_manager.complete_context_analysis()
         
-        # Этап 2: 50-75% - Синтез (промпт 05)
+        # Этап 3: 50% → 75% - Глубокий синтез (промпт 05) - ОТДЕЛЬНЫЙ запрос
         await progress_manager.start_synthesis()
+        logger.info("=== Этап 3: Глубокий синтез ===")
         
-        success = await llm_session.generate_synthesis()
-        if not success:
-            return None
-            
+        await llm_session.stage_3_deep_synthesis()
+        
         await progress_manager.complete_synthesis()
         
-        # Этап 3: 75-100% - Финальная интерпретация (промпт 06)
+        # Этап 4: 75% → 100% - Финальная интерпретация (промпт 06) - ОТДЕЛЬНЫЙ запрос
         await progress_manager.start_final_interpretation()
+        logger.info("=== Этап 4: Финальная интерпретация ===")
         
-        interpretation = await llm_session.generate_final_interpretation()
+        interpretation = await llm_session.stage_4_final_response()
         
         await progress_manager.complete_final_interpretation()
         
+        logger.info("🎯 МНОГОЭТАПНАЯ интерпретация успешно завершена!")
         return interpretation
         
     except Exception as e:
-        logger.error(f"Ошибка при генерации интерпретации с визуальным прогрессом: {e}")
+        logger.error(f"Ошибка при генерации многоэтапной интерпретации: {e}")
         return None
 
 
@@ -417,11 +428,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                         await asyncio.wait_for(
                             update.message.reply_photo(
                                 photo=image_bytes,
-                                caption=full_message,
-                                read_timeout=TIMEOUT,
-                                write_timeout=TIMEOUT,
-                                connect_timeout=TIMEOUT,
-                                pool_timeout=TIMEOUT
+                                caption=full_message
                             ),
                             timeout=TIMEOUT
                         )
@@ -430,11 +437,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                         await asyncio.wait_for(
                             update.message.reply_photo(
                                 photo=image_bytes,
-                                caption=cards_description,
-                                read_timeout=TIMEOUT,
-                                write_timeout=TIMEOUT,
-                                connect_timeout=TIMEOUT,
-                                pool_timeout=TIMEOUT
+                                caption=cards_description
                             ),
                             timeout=TIMEOUT
                         )
@@ -447,11 +450,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                         if len(interpretation_text) <= max_text_length:
                             await asyncio.wait_for(
                                 update.message.reply_text(
-                                    interpretation_text,
-                                    read_timeout=TIMEOUT,
-                                    write_timeout=TIMEOUT,
-                                    connect_timeout=TIMEOUT,
-                                    pool_timeout=TIMEOUT
+                                    interpretation_text
                                 ),
                                 timeout=TIMEOUT
                             )
@@ -461,11 +460,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                             for i, part in enumerate(parts):
                                 await asyncio.wait_for(
                                     update.message.reply_text(
-                                        part,
-                                        read_timeout=TIMEOUT,
-                                        write_timeout=TIMEOUT,
-                                        connect_timeout=TIMEOUT,
-                                        pool_timeout=TIMEOUT
+                                        part
                                     ),
                                     timeout=TIMEOUT
                                 )
@@ -475,11 +470,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                     # Нет изображения - отправляем только текст
                     await asyncio.wait_for(
                         update.message.reply_text(
-                            full_message,
-                            read_timeout=TIMEOUT,
-                            write_timeout=TIMEOUT,
-                            connect_timeout=TIMEOUT,
-                            pool_timeout=TIMEOUT
+                            full_message
                         ),
                         timeout=TIMEOUT
                     )
@@ -498,9 +489,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
                     try:
                         await update.message.reply_text(
                             "⚠️ Интерпретация готова, но произошла ошибка при отправке изображения. "
-                            "Попробуйте создать новый расклад.",
-                            read_timeout=30,
-                            write_timeout=30
+                            "Попробуйте создать новый расклад."
                         )
                     except:
                         pass
@@ -532,9 +521,7 @@ async def send_final_interpretation_with_image(update: Update, context: ContextT
         # Уведомляем пользователя об ошибке
         try:
             await update.message.reply_text(
-                "❌ Произошла ошибка при отправке интерпретации. Попробуйте создать новый расклад.",
-                read_timeout=30,
-                write_timeout=30
+                "❌ Произошла ошибка при отправке интерпретации. Попробуйте создать новый расклад."
             )
         except:
             pass

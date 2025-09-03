@@ -5,25 +5,13 @@
 import re
 import logging
 import asyncio
-import random
-import time
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
 
 from src.openrouter_client import TarotLLMAgent, MessageContext
 from src.prompt_manager import PromptManager
-from src.config import load_config
 
 logger = logging.getLogger(__name__)
-
-def _generate_random_magic_number(user_id: int) -> int:
-    """
-    Генерирует случайное магическое число для LLM сессии при отключенных magic numbers
-    """
-    base_seed = int(time.time() * 1000000)
-    user_seed = hash(str(user_id)) % 10000
-    random_component = random.randint(1, 999)
-    return (base_seed + user_seed + random_component) % 999 + 1
 
 class InterpretationStage(Enum):
     """Этапы интерпретации согласно LLM_algorithm.md"""
@@ -39,9 +27,9 @@ class MultiStageLLMSession:
     Ключевая идея: каждый этап - это отдельный LLM запрос с накапливающимся контекстом
     """
     
-    def __init__(self, agent: TarotLLMAgent, prompt_manager: PromptManager):
-        self.agent = agent
+    def __init__(self, prompt_manager: PromptManager, model_name: str = "deepseek/deepseek-chat-v3-0324:free"):
         self.prompt_manager = prompt_manager
+        self.agent = TarotLLMAgent(model_name=model_name)
         self.context = MessageContext()
         
         # Данные сессии
@@ -50,7 +38,7 @@ class MultiStageLLMSession:
         self.spread_config = {}
         self.user_name = ""
         self.user_age = 0
-        self.magic_number = 1  # Будет перезаписан при инициализации
+        self.magic_number = 1
         self.preliminary_answers = []
         self.llm_questions = []
         self.llm_answers = []
@@ -58,7 +46,7 @@ class MultiStageLLMSession:
         # Текущий этап
         self.current_stage = InterpretationStage.QUESTIONS_GENERATION
         
-        logger.info(f"Инициализирована многоэтапная LLM сессия с агентом {type(self.agent).__name__}")
+        logger.info(f"Инициализирована многоэтапная LLM сессия с моделью {model_name}")
 
     def setup_spread(self, spread_type: str, selected_cards: List[Dict], 
                     spread_config: Dict, user_name: str, user_age: int, magic_number: int):
@@ -90,34 +78,20 @@ class MultiStageLLMSession:
         self.context.clear()
         
         # Промпт 1: Системная персона
-        system_prompt = self.prompt_manager.get_system_persona(self.user_name, self.user_age)
+        system_prompt = self.prompt_manager.get_system_persona()
         self.context.add_system_message(system_prompt)
         
         # Промпт 2: Контекст конкретного расклада
-        # Подготавливаем позиции из spread_config - это список строк, а не словарей
-        positions = self.spread_config.get('card_meanings', ['Позиция'])
-        
-        spread_context = self.prompt_manager.get_spread_context(
-            self.spread_type, 
-            self.selected_cards, 
-            positions
-        )
-        self.context.add_user_message(spread_context)
+        spread_context = self.prompt_manager.get_spread_context(self.spread_type)
+        formatted_spread_context = self._format_spread_context(spread_context)
+        self.context.add_user_message(formatted_spread_context)
         
         # Добавляем предварительные ответы в контекст
         preliminary_context = self._format_preliminary_answers()
         self.context.add_user_message(preliminary_context)
         
         # Промпт 3: Запрос на психологический анализ и генерацию вопросов
-        # Извлекаем текстовые ответы из preliminary_answers
-        text_answers = []
-        for answer in preliminary_answers:
-            if isinstance(answer, dict):
-                text_answers.append(answer.get('answer', ''))
-            else:
-                text_answers.append(str(answer))
-        
-        analysis_prompt = self.prompt_manager.get_psychological_analysis_prompt(text_answers)
+        analysis_prompt = self.prompt_manager.get_psychological_analysis_prompt()
         self.context.add_user_message(analysis_prompt)
         
         # Делаем LLM запрос для генерации вопросов
@@ -222,6 +196,16 @@ class MultiStageLLMSession:
 
     # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
 
+    def _format_spread_context(self, spread_context: str) -> str:
+        """Форматирует контекст расклада с данными карт"""
+        # Добавляем информацию о выбранных картах
+        cards_info = ""
+        for i, card in enumerate(self.selected_cards, 1):
+            cards_info += f"\n**Позиция {i}: {card['name']}**\n"
+            cards_info += f"Архив: {card.get('arcana', 'Не указано')}\n"
+            cards_info += f"Значения: {card.get('fortune_telling', ['Не указано'])}\n"
+        
+        return spread_context.replace("{cards_data}", cards_info)
 
     def _format_preliminary_answers(self) -> str:
         """Форматирует предварительные ответы пользователя"""
@@ -337,21 +321,13 @@ class MultiStageLLMSession:
         Возвращает (вопросы, None) если нужны уточнения, или ([], интерпретация) если готово
         """
         # Настраиваем данные
-        # Генерируем случайное magic_number если magic_numbers отключены
-        config = load_config()
-        if config.get('features', {}).get('use_magic_numbers', True):
-            magic_number = user_data.get('magic_number', 1)
-        else:
-            user_id = user_data.get('user_id', user_data.get('id', 1))
-            magic_number = _generate_random_magic_number(user_id)
-        
         self.setup_spread(
             spread_type=spread_data['spread_type'],
             selected_cards=spread_data['cards'],
             spread_config={'card_meanings': ['Позиция расклада']},
             user_name=user_data['name'],
             user_age=user_data['age'],
-            magic_number=magic_number
+            magic_number=1
         )
         
         # Выполняем только этап 1 - генерацию вопросов

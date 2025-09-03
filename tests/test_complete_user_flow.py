@@ -108,7 +108,8 @@ def test_complete_user_registration_flow():
     # Этап 6: Сохранение пользователя в хранилище
     print("\n6️⃣ Сохранение пользователя в хранилище:")
     session_data = get_user_data(test_chat_id)
-    success = save_user(test_chat_id, session_data['name'], session_data['birthdate'])
+    # Используем test_chat_id как user_id для тестов (в реальности это разные параметры)
+    success = save_user(test_chat_id, test_chat_id, session_data['name'], session_data['birthdate'])
     print(f"   Сохранение: {'✅' if success else '❌'}")
     assert success, "Пользователь должен сохраниться"
     
@@ -231,7 +232,7 @@ def test_multiple_users_isolation():
     # Этап 3: Сохранение всех пользователей
     print("\n3️⃣ Сохранение всех пользователей:")
     for chat_id, name, birthdate, spread_type in users_data:
-        success = save_user(chat_id, name, birthdate)
+        success = save_user(chat_id, chat_id, name, birthdate)  # chat_id используется как user_id для тестов
         assert success, f"Не удалось сохранить пользователя {name}"
         print(f"   Сохранён: {name}")
     

@@ -4,9 +4,10 @@
 import logging
 import io
 import time
+import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from src.keyboards import main_menu, spreads_menu, back_button, SPREAD_NAMES, tariff_selection_menu, credits_info_menu
+from src.keyboards import main_menu, spreads_menu, back_button, SPREAD_NAMES, tariff_selection_menu, credits_info_menu, spread_guide_navigation
 from src.simple_state import UserState, get_state, set_state, update_data, get_user_data, reset_to_idle, add_message_to_delete
 from src.validators import validate_name, validate_birthdate, validate_magic_number
 from src.user_manager import user_exists, save_user, get_user, update_last_spread, get_user_credits, use_credit, has_credits
@@ -19,6 +20,28 @@ from src.llm_integration import start_llm_interpretation, process_llm_questions
 
 from src.feedback_system import get_feedback_system
 from PIL import Image
+
+def generate_random_magic_number(user_id: int) -> int:
+    """
+    Генерирует случайное магическое число для пользователя при отключенных магических числах
+    
+    Использует комбинированный seed из нескольких источников энтропии:
+    - Текущее время с микросекундами  
+    - Уникальный идентификатор пользователя
+    - Дополнительный случайный компонент
+    
+    :param user_id: ID пользователя Telegram
+    :return: Случайное число от 1 до 999
+    """
+    # Комбинированный seed из multiple источников энтропии
+    base_seed = int(time.time() * 1000000)  # Микросекунды для высокой точности
+    user_seed = hash(str(user_id)) % 10000   # Уникальность пользователя  
+    random_component = random.randint(1, 999) # Дополнительная случайность
+    
+    # Комбинируем все источники энтропии
+    combined_seed = (base_seed + user_seed + random_component) % 999 + 1
+    
+    return combined_seed
 
 def is_magic_numbers_enabled() -> bool:
     """Проверяет, включены ли магические числа в конфигурации"""
@@ -43,7 +66,8 @@ async def proceed_to_questions_or_magic_number(update: Update, context: ContextT
     else:
         # Пропускаем магическое число - переходим сразу к вопросам
         session_data = get_user_data(chat_id)
-        magic_number = int(time.time() * 1000) % 999 + 1  # Используем время сервера как случайное число когда магические числа отключены
+        user_id = session_data.get('user_id', update.effective_user.id)
+        magic_number = generate_random_magic_number(user_id)  # Генерируем случайное число
         
         # Обновляем данные сессии
         update_data(chat_id, 'magic_number', magic_number)
@@ -62,7 +86,11 @@ async def start_preliminary_questions(update: Update, context: ContextTypes.DEFA
     try:
         session_data = get_user_data(chat_id)
         spread_type = session_data.get('spread_type')
-        magic_number = session_data.get('magic_number', int(time.time() * 1000) % 999 + 1)
+        # Если magic_number не установлен, генерируем случайный
+        magic_number = session_data.get('magic_number')
+        if magic_number is None:
+            user_id = session_data.get('user_id', update.effective_user.id) 
+            magic_number = generate_random_magic_number(user_id)
         
         # Получаем предварительные вопросы для расклада
         spread_config_type = SPREAD_MAPPING.get(spread_type, spread_type)
@@ -416,6 +444,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await handle_spreads_list(update, context)
         elif callback_data == "help":
             await handle_help(update, context)
+        elif callback_data == "spread_guide":
+            # Гид по раскладам - показываем первый шаг (ВАЖНО: проверяем ДО общего spread_)
+            await handle_spread_guide(update, context, step=1)
         elif callback_data.startswith("spread_"):
             await handle_spread_selection(update, context)
         elif callback_data.startswith("rate_"):
@@ -441,6 +472,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif callback_data == "refill_info":
             # Информация о пополнении
             await handle_refill_info(update, context)
+        elif callback_data.startswith("guide_step_"):
+            # Навигация по шагам гида
+            try:
+                step = int(callback_data.split("_")[-1])
+                await handle_spread_guide(update, context, step=step)
+            except (ValueError, IndexError):
+                await query.edit_message_text(
+                    text="❌ Ошибка навигации",
+                    reply_markup=back_button("spreads_list")
+                )
         else:
             # Неизвестный callback
             await query.edit_message_text(
@@ -1004,7 +1045,8 @@ async def handle_tariff_selection(update: Update, context: ContextTypes.DEFAULT_
                     )
                 else:
                     # Пропускаем магическое число - переходим сразу к вопросам
-                    update_data(chat_id, 'magic_number', 1)
+                    random_magic = generate_random_magic_number(user_id)
+                    update_data(chat_id, 'magic_number', random_magic)
                     
                     await query.edit_message_text(
                         f"🔮 Привет снова, {user_data['name']}!\n\n"
@@ -1068,6 +1110,101 @@ async def handle_refill_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     except Exception as e:
         logger.error(f"Ошибка при показе информации о пополнении: {e}")
+
+
+async def handle_spread_guide(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int = 1) -> None:
+    """
+    Показывает гид по раскладам - многошаговое объяснение применения каждого расклада
+    
+    :param update: Объект обновления от Telegram
+    :param context: Контекст бота
+    :param step: Номер шага гида (1-5)
+    """
+    try:
+        query = update.callback_query
+        
+        # Тексты для каждого шага гида
+        guide_texts = {
+            1: (
+                "🤔 Какой расклад выбрать?\n\n"
+                "Каждый расклад Таро предназначен для определённых ситуаций. Выбор правильного расклада поможет получить максимально точную и полезную интерпретацию.\n\n"
+                "📚 Ниже представлен гид по всем доступным раскладам:"
+            ),
+            2: (
+                "🎴 **ПРОСТЫЕ РАСКЛАДЫ**\n\n"
+                "✨ **На одну карту**\n"
+                "• Быстрый совет на день\n"
+                "• Простой ответ на конкретный вопрос\n"
+                "• Первое знакомство с Таро\n"
+                "• Ежедневная духовная практика\n"
+                "_Примеры: \"Стоит ли принимать это предложение?\", \"На что обратить внимание сегодня?\"_\n\n"
+                "🔮 **На три карты (Прошлое-Настоящее-Будущее)**\n"
+                "• Понимание развития ситуации во времени\n"
+                "• Анализ причин и следствий\n"
+                "• Планирование ближайших действий\n"
+                "_Примеры: развитие отношений, карьерные изменения, личностный рост_"
+            ),
+            3: (
+                "🎯 **СПЕЦИАЛИЗИРОВАННЫЕ РАСКЛАДЫ**\n\n"
+                "🍀 **Подкова (7 карт)**\n"
+                "• Планирование и достижение целей\n"
+                "• Преодоление препятствий\n"
+                "• Комплексный анализ ситуации\n"
+                "_Примеры: запуск нового проекта, решение сложных проблем, поиск выхода из кризиса_\n\n"
+                "💕 **Любовный треугольник (6 карт)**\n"
+                "• Сложные любовные ситуации\n"
+                "• Выбор между партнерами\n"
+                "• Анализ чувств и эмоций\n"
+                "_Примеры: любовный треугольник, неопределённость в отношениях, решение о разводе_"
+            ),
+            4: (
+                "🔍 **ГЛУБОКИЕ РАСКЛАДЫ**\n\n"
+                "✟ **Кельтский крест (10 карт)**\n"
+                "• Глубокий анализ жизненной ситуации\n"
+                "• Комплексные жизненные вопросы\n"
+                "• Понимание скрытых мотиваций\n"
+                "• Духовный поиск\n"
+                "_Примеры: кардинальные изменения в жизни, поиск предназначения, судьбоносные решения_\n\n"
+                "📅 **Прогноз на неделю (7 карт)**\n"
+                "• Планирование предстоящей недели\n"
+                "• Подготовка к важным событиям\n"
+                "• Понимание энергий каждого дня\n"
+                "_Примеры: важная рабочая неделя, подготовка к экзаменам, период восстановления_"
+            ),
+            5: (
+                "🎡 **ДОЛГОСРОЧНОЕ ПЛАНИРОВАНИЕ**\n\n"
+                "🎡 **Колесо года (12 карт)**\n"
+                "• Планирование года\n"
+                "• Понимание жизненных циклов\n"
+                "• Долгосрочные цели и мечты\n"
+                "• Духовное развитие на год\n"
+                "• Подведение итогов прошедшего года\n\n"
+                "**Идеально подходит для:**\n"
+                "• Начала нового года\n"
+                "• Дня рождения\n"
+                "• Важных жизненных рубежей\n"
+                "• Планирования карьеры\n"
+                "• Семейного планирования\n\n"
+                "💡 **Совет:** Выбирайте расклад исходя из глубины вашего вопроса и времени, которое готовы потратить на размышления."
+            )
+        }
+        
+        text = guide_texts.get(step, guide_texts[1])
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=spread_guide_navigation(step),
+            parse_mode='Markdown'
+        )
+        
+        logger.info(f"Показан шаг {step} гида по раскладам для пользователя {query.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе гида по раскладам шаг {step}: {e}")
+        await query.edit_message_text(
+            "❌ Произошла ошибка при загрузке гида",
+            reply_markup=back_button("spreads_list")
+        )
 
 
 # Для совместимости с существующим кодом

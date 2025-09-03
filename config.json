@@ -1,6 +1,6 @@
 {
-    "telegram_bot_token": "7140895678:AAHMl0ZWBMbaWMmFx-8XLoLmsSscfFNn8Vw",
-    "openrouter_api_key": "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",
+    "telegram_bot_token": "",
+    "openrouter_api_key": "",
     "bot_username": "@personal_tarot_ai_bot",
     "model_name": "deepseek/deepseek-chat-v3-0324:free",
     "max_message_length": 4096,

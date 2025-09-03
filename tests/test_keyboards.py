@@ -19,11 +19,12 @@ def test_main_menu():
     
     # Проверяем количество кнопок
     buttons = keyboard.inline_keyboard
-    assert len(buttons) == 2  # "Сделать расклад" и "Помощь"
+    assert len(buttons) == 3  # "Сделать расклад", "Мои расклады" и "Помощь"
     
     # Проверяем callback_data
     assert buttons[0][0].callback_data == "spreads_list"
-    assert buttons[1][0].callback_data == "help"
+    assert buttons[1][0].callback_data == "my_credits"  
+    assert buttons[2][0].callback_data == "help"
     
     print("✅ test_main_menu прошёл")
 

@@ -33,6 +33,7 @@ def spreads_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✝️ Кельтский крест", callback_data="spread_celtic")],
         [InlineKeyboardButton("📅 Прогноз на неделю", callback_data="spread_week")],
         [InlineKeyboardButton("🎡 Колесо года", callback_data="spread_year")],
+        [InlineKeyboardButton("🤔 Какой расклад выбрать?", callback_data="spread_guide")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -106,6 +107,33 @@ def credits_info_menu() -> InlineKeyboardMarkup:
     :return: Inline-клавиатура для экрана с информацией о кредитах
     """
     return back_button("back_to_main")
+
+
+def spread_guide_navigation(step: int = 1) -> InlineKeyboardMarkup:
+    """
+    Навигация для гида по раскладам с кнопками "Далее", "Назад" и "К раскладам"
+    
+    :param step: Номер текущего шага (1-5)
+    :return: Inline-клавиатура для навигации по гиду
+    """
+    keyboard = []
+    
+    # Создаём кнопки "Назад" и "Далее" в одной строке если это не первый/последний шаг
+    navigation_row = []
+    
+    if step > 1:
+        navigation_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"guide_step_{step - 1}"))
+    
+    if step < 5:
+        navigation_row.append(InlineKeyboardButton("Далее ➡️", callback_data=f"guide_step_{step + 1}"))
+    
+    if navigation_row:
+        keyboard.append(navigation_row)
+    
+    # Всегда добавляем кнопку возврата к раскладам
+    keyboard.append([InlineKeyboardButton("◀️ К раскладам", callback_data="spreads_list")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 
 # Словарь с названиями раскладов для удобства
