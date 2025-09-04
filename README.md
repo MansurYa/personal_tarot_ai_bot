@@ -2,6 +2,8 @@
 
 > Интеллектуальный Telegram-бот для профессиональных таро-гаданий с инновационной многоэтапной LLM-архитектурой
 
+Опробывать телеграм бота: ![@personal_tarot_ai_bot](tg://resolve?domain=personal_tarot_ai_bot)
+
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://python.org)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-2CA5E0.svg)](https://core.telegram.org/bots/api)
 [![OpenRouter](https://img.shields.io/badge/OpenRouter-LLM-purple.svg)](https://openrouter.ai)
