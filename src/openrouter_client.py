@@ -185,7 +185,7 @@ async def send_request(
         "X-Title": "Personal Tarot Bot"
     }
     
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=300)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
